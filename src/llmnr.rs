@@ -1,11 +1,11 @@
-use std::{net::{IpAddr, Ipv4Addr, UdpSocket}, io};
+use std::{net::{IpAddr, Ipv4Addr, UdpSocket, SocketAddr}, io, thread};
 
 use bit_vec::BitVec;
-use pnet::{packet::{udp::{UdpPacket, MutableUdpPacket}, Packet, ip::IpNextHeaderProtocols}, transport::{transport_channel, TransportChannelType, TransportProtocol}};
+use pnet::{packet::{udp::{UdpPacket, MutableUdpPacket}, ip::IpNextHeaderProtocols}, transport::{transport_channel, TransportChannelType, TransportProtocol}};
 use rand::Rng;
 
 
-pub fn generate<'a>(id : &'a u16) -> UdpPacket<'a>{
+fn generate<'a>(id : &'a u16) -> UdpPacket<'a>{
 
     
     let mut complete_payload_with_headers = BitVec::from_elem(96, false);
@@ -68,7 +68,7 @@ pub fn generate<'a>(id : &'a u16) -> UdpPacket<'a>{
 }
 
 
-pub fn send_request(packet: UdpPacket) -> io::Result<usize> {
+fn send_request(packet: UdpPacket) -> io::Result<usize> {
     let (mut txv4, _) = match transport_channel(4096, TransportChannelType::Layer4(TransportProtocol::Ipv4(IpNextHeaderProtocols::Udp))) {
         Ok((txv4, rxv4)) => (txv4, rxv4),
         Err(e) => panic!("An error occurred when creating the transport channel: {}", e),
@@ -78,7 +78,15 @@ pub fn send_request(packet: UdpPacket) -> io::Result<usize> {
 
 }
 
-pub fn await_response<'a>(id : &'a u16) -> BitVec {
+fn await_response<'a>(id : &'a u16) -> (BitVec,SocketAddr) {
+    // id to bits
+    let mut id_bits = BitVec::from_elem(16, false);
+    for i in 0..16{
+        if *id & (1 << i) != 0{
+            id_bits.set(i, true);
+        }
+    }
+
     let socket = UdpSocket::bind("0.0.0.0:5355");
     socket.as_ref().unwrap().join_multicast_v4(&Ipv4Addr::new(224,0,0,252), &Ipv4Addr::new(0,0,0,0));
     let mut socket = socket.unwrap();
@@ -111,13 +119,60 @@ pub fn await_response<'a>(id : &'a u16) -> BitVec {
         for i in 96..bit_vec.len() {
             new_bit_vec.set(i - 96, bit_vec[i]);
         }
+        // Get the first 16 bit of header and save them in a new BitVec
+        let mut id_from_answer = BitVec::from_elem(16, false);
+        for i in 0..16 {
+            id_from_answer.set(i, first_96_bits[i]);
+        }
 
-        println!("Header: {:?}", first_96_bits);
-        println!("Payload: {:?}", new_bit_vec);
+        if id_bits == id_from_answer {
+            println!("Received LLMNR Answer!");
+            return (new_bit_vec,src_addr);
+        }
     }
 }
 
-/*
-Header: 100100010101100110000000000000000000000000000001000000000000000100000000000000000000000000000000
-Payload: 0001000101100101011011100111000101100100011011110110011101101101011110010110100001110110011000010111010101101110011000110111010101111000011010110000000000000000000000010000000000000001000100010110010101101110011100010110010001101111011001110110110101111001011010000111011001100001011101010110111001100011011101010111100001101011000000000000000000000001000000000000000100000000000000000000000000011110000000000000010011000000101010001011001010101111
- */
+fn extract_ip_from_response_body(response: BitVec) -> BitVec {
+    // return the last 32 bits of the response
+    let mut ip_bits = BitVec::from_elem(32, false);
+    for i in 0..32 {
+        ip_bits.set(i, response[i + response.len() - 32]);
+    }
+    ip_bits
+}
+
+pub fn search_until_responder_found() -> SocketAddr{
+    loop {
+        let mut rng = rand::thread_rng();   
+        let id: u16 = rng.gen();
+        let handler = thread::spawn(move || {
+            await_response(&id)
+        });
+    
+        let a_package = generate(&id);
+        let result = send_request(a_package);
+        match result {
+            Ok(_) => println!("Sent request"),
+            Err(e) => println!("Error sending request: {}", e),
+        }
+        
+        let (body, src) = handler.join().unwrap();
+    
+        println!("Suspected Responder at: {}", src.ip());
+        
+        let octets = match src.ip() {
+            IpAddr::V4(ip) => Ok(ip.octets()),
+            _ => Err("Not an IPv4 Address"),
+        };
+    
+        let target_ip = extract_ip_from_response_body(body).to_bytes();
+        
+        // build a string from the octets
+        if src.ip().to_string() == format!("{}.{}.{}.{}", target_ip[0], target_ip[1], target_ip[2], target_ip[3]) {
+            println!("Responder Detected!");
+            return src;
+        }
+    }
+   
+
+}
